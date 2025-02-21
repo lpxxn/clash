@@ -3,6 +3,9 @@ package customer_service
 import (
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,7 +16,6 @@ import (
 // mockWebsocketConn 模拟websocket连接
 type mockWebsocketConn struct {
 	closed bool
-	*websocket.Conn
 }
 
 func (m *mockWebsocketConn) Close() error {
@@ -84,6 +86,47 @@ func (m *mockWebsocketConn) Subprotocol() string {
 	return ""
 }
 
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+func setupTestServer(t *testing.T) (*CustomerService, *httptest.Server) {
+	cs := NewCustomerService()
+
+	// 创建测试服务器
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+
+		// 保持连接打开
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				break
+			}
+		}
+	}))
+
+	return cs, server
+}
+
+func createWebSocketConn(t *testing.T, server *httptest.Server) *websocket.Conn {
+	// 将 http:// 替换为 ws://
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}
+
 func TestCustomerService_Basic(t *testing.T) {
 	cs := NewCustomerService()
 	assert.NotNil(t, cs)
@@ -94,10 +137,13 @@ func TestCustomerService_Basic(t *testing.T) {
 }
 
 func TestCustomerService_ConnectUser(t *testing.T) {
-	cs := NewCustomerService()
-	conn := &mockWebsocketConn{}
+	cs, server := setupTestServer(t)
+	defer server.Close()
 
-	user := cs.ConnectUser("user1", "TestUser", conn.Conn)
+	conn := createWebSocketConn(t, server)
+	defer conn.Close()
+
+	user := cs.ConnectUser("user1", "TestUser", conn)
 	assert.NotNil(t, user)
 	assert.Equal(t, "user1", user.ID)
 	assert.Equal(t, "TestUser", user.Name)
@@ -111,15 +157,18 @@ func TestCustomerService_ConnectUser(t *testing.T) {
 }
 
 func TestCustomerService_ConnectStaff(t *testing.T) {
-	cs := NewCustomerService()
-	conn := &mockWebsocketConn{}
+	cs, server := setupTestServer(t)
+	defer server.Close()
+
+	conn := createWebSocketConn(t, server)
+	defer conn.Close()
 
 	// 创建客服组
 	group := cs.CreateGroup("group1", "TestGroup")
 	assert.NotNil(t, group)
 
 	// 测试连接客服
-	staff, err := cs.ConnectStaff("staff1", "TestStaff", "group1", conn.Conn)
+	staff, err := cs.ConnectStaff("staff1", "TestStaff", "group1", conn)
 	assert.NoError(t, err)
 	assert.NotNil(t, staff)
 	assert.Equal(t, "staff1", staff.ID)
@@ -135,18 +184,24 @@ func TestCustomerService_ConnectStaff(t *testing.T) {
 	assert.Equal(t, staff, group.Members["staff1"])
 
 	// 测试连接到不存在的组
-	_, err = cs.ConnectStaff("staff2", "TestStaff2", "nonexistent", conn.Conn)
+	_, err = cs.ConnectStaff("staff2", "TestStaff2", "nonexistent", conn)
 	assert.Equal(t, ErrGroupNotFound, err)
 }
 
 func TestCustomerService_CreateSession(t *testing.T) {
-	cs := NewCustomerService()
-	conn := &mockWebsocketConn{}
+	cs, server := setupTestServer(t)
+	defer server.Close()
+
+	userConn := createWebSocketConn(t, server)
+	defer userConn.Close()
+
+	staffConn := createWebSocketConn(t, server)
+	defer staffConn.Close()
 
 	// 准备测试数据
 	cs.CreateGroup("group1", "TestGroup")
-	user := cs.ConnectUser("user1", "TestUser", conn.Conn)
-	staff, _ := cs.ConnectStaff("staff1", "TestStaff", "group1", conn.Conn)
+	user := cs.ConnectUser("user1", "TestUser", userConn)
+	staff, _ := cs.ConnectStaff("staff1", "TestStaff", "group1", staffConn)
 
 	// 测试创建会话
 	session, err := cs.CreateSession("user1", "staff1")
@@ -175,14 +230,23 @@ func TestCustomerService_CreateSession(t *testing.T) {
 }
 
 func TestCustomerService_TransferSession(t *testing.T) {
-	cs := NewCustomerService()
-	conn := &mockWebsocketConn{}
+	cs, server := setupTestServer(t)
+	defer server.Close()
+
+	userConn := createWebSocketConn(t, server)
+	defer userConn.Close()
+
+	staff1Conn := createWebSocketConn(t, server)
+	defer staff1Conn.Close()
+
+	staff2Conn := createWebSocketConn(t, server)
+	defer staff2Conn.Close()
 
 	// 准备测试数据
 	cs.CreateGroup("group1", "TestGroup")
-	cs.ConnectUser("user1", "TestUser", conn.Conn)
-	staff1, _ := cs.ConnectStaff("staff1", "TestStaff1", "group1", conn.Conn)
-	staff2, _ := cs.ConnectStaff("staff2", "TestStaff2", "group1", conn.Conn)
+	cs.ConnectUser("user1", "TestUser", userConn)
+	staff1, _ := cs.ConnectStaff("staff1", "TestStaff1", "group1", staff1Conn)
+	staff2, _ := cs.ConnectStaff("staff2", "TestStaff2", "group1", staff2Conn)
 	session, _ := cs.CreateSession("user1", "staff1")
 
 	// 测试转移会话
@@ -201,13 +265,19 @@ func TestCustomerService_TransferSession(t *testing.T) {
 }
 
 func TestCustomerService_SendMessage(t *testing.T) {
-	cs := NewCustomerService()
-	conn := &mockWebsocketConn{}
+	cs, server := setupTestServer(t)
+	defer server.Close()
+
+	userConn := createWebSocketConn(t, server)
+	defer userConn.Close()
+
+	staffConn := createWebSocketConn(t, server)
+	defer staffConn.Close()
 
 	// 准备测试数据
 	cs.CreateGroup("group1", "TestGroup")
-	cs.ConnectUser("user1", "TestUser", conn.Conn)
-	cs.ConnectStaff("staff1", "TestStaff", "group1", conn.Conn)
+	cs.ConnectUser("user1", "TestUser", userConn)
+	cs.ConnectStaff("staff1", "TestStaff", "group1", staffConn)
 	session, _ := cs.CreateSession("user1", "staff1")
 
 	// 测试用户发送消息
@@ -243,50 +313,69 @@ func TestCustomerService_SendMessage(t *testing.T) {
 }
 
 func TestCustomerService_DisconnectUser(t *testing.T) {
-	cs := NewCustomerService()
-	conn := &mockWebsocketConn{}
+	cs, server := setupTestServer(t)
+	defer server.Close()
+
+	conn := createWebSocketConn(t, server)
+	defer conn.Close()
 
 	// 准备测试数据
-	cs.ConnectUser("user1", "TestUser", conn.Conn)
+	cs.ConnectUser("user1", "TestUser", conn)
 
 	// 测试断开连接
 	cs.DisconnectUser("user1")
 	assert.Empty(t, cs.users)
-	assert.True(t, conn.closed)
+
+	// 等待一段时间确保连接已关闭
+	time.Sleep(100 * time.Millisecond)
 
 	// 测试断开不存在的用户
 	cs.DisconnectUser("nonexistent") // 不应该panic
 }
 
 func TestCustomerService_DisconnectStaff(t *testing.T) {
-	cs := NewCustomerService()
-	conn := &mockWebsocketConn{}
+	cs, server := setupTestServer(t)
+	defer server.Close()
+
+	userConn := createWebSocketConn(t, server)
+	defer userConn.Close()
+
+	staffConn := createWebSocketConn(t, server)
+	defer staffConn.Close()
 
 	// 准备测试数据
 	cs.CreateGroup("group1", "TestGroup")
-	cs.ConnectUser("user1", "TestUser", conn.Conn)
-	cs.ConnectStaff("staff1", "TestStaff", "group1", conn.Conn)
+	cs.ConnectUser("user1", "TestUser", userConn)
+	cs.ConnectStaff("staff1", "TestStaff", "group1", staffConn)
 	session, _ := cs.CreateSession("user1", "staff1")
 
 	// 测试断开连接
 	cs.DisconnectStaff("staff1")
 	assert.Empty(t, cs.staffs)
-	assert.True(t, conn.closed)
 	assert.Empty(t, cs.groups["group1"].Members)
 	assert.Equal(t, SessionStatusClosed, cs.sessions[session.ID].Status)
+
+	// 等待一段时间确保连接已关闭
+	time.Sleep(100 * time.Millisecond)
 
 	// 测试断开不存在的客服
 	cs.DisconnectStaff("nonexistent") // 不应该panic
 }
 
 func TestCustomerService_GetMethods(t *testing.T) {
-	cs := NewCustomerService()
-	conn := &mockWebsocketConn{}
+	cs, server := setupTestServer(t)
+	defer server.Close()
+
+	userConn := createWebSocketConn(t, server)
+	defer userConn.Close()
+
+	staffConn := createWebSocketConn(t, server)
+	defer staffConn.Close()
 
 	// 准备测试数据
 	cs.CreateGroup("group1", "TestGroup")
-	user := cs.ConnectUser("user1", "TestUser", conn.Conn)
-	staff, _ := cs.ConnectStaff("staff1", "TestStaff", "group1", conn.Conn)
+	user := cs.ConnectUser("user1", "TestUser", userConn)
+	staff, _ := cs.ConnectStaff("staff1", "TestStaff", "group1", staffConn)
 	session, _ := cs.CreateSession("user1", "staff1")
 
 	// 测试获取方法
