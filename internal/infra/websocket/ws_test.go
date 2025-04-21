@@ -64,6 +64,7 @@ func TestWebSocketJSONMessage(t *testing.T) {
 				t.Error(err)
 				return
 			}
+			t.Logf("Received message: %s\n", msg)
 			// fmt.Printf("Received message: %s\n", msg)
 			mu.Lock()
 			receivedMessages = append(receivedMessages, message)
